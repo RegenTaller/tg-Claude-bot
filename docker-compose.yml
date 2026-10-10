@@ -3,5 +3,20 @@ services:
     build: .
     env_file: .env
     volumes:
-      - ./data:/data
+      - ./data:/data  # база SQLite лежит на сервере в папке data рядом с этим файлом
     restart: unless-stopped
+    # Портов нет: бот сам ходит в Telegram и Anthropic и ничего не слушает,
+    # поэтому с портами VPN он не пересекается.
+    mem_limit: ${BOT_MEM_LIMIT:-1g}  # не даст боту отнять память у VPN
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:  # без этого логи Docker растут бесконечно
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

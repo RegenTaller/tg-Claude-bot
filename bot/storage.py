@@ -9,6 +9,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .config import cost_usd
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id         INTEGER PRIMARY KEY,
@@ -41,18 +43,39 @@ CREATE TABLE IF NOT EXISTS usage (
     output_tokens INTEGER NOT NULL,
     cache_read    INTEGER NOT NULL,
     cache_write   INTEGER NOT NULL,
-    created_at    REAL NOT NULL
+    created_at    REAL NOT NULL,
+    cost_usd      REAL
 );
+CREATE INDEX IF NOT EXISTS usage_time ON usage(created_at);
 """
 
 
 class Storage:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript(SCHEMA)
-        self.db.commit()
+        try:
+            self.db = sqlite3.connect(path)
+            self.db.row_factory = sqlite3.Row
+            self._migrate()
+            self.db.executescript(SCHEMA)
+            self.db.commit()
+        except sqlite3.OperationalError as e:
+            raise SystemExit(
+                f"Не открывается база {path}: {e}. Если бот запущен в Docker — проверьте права "
+                "на папку data на сервере (см. docs/deploy.md, раздел про папку data)."
+            )
+
+    def _migrate(self) -> None:
+        """Обновляет базу, созданную прежней версией бота."""
+        cols = [r[1] for r in self.db.execute("PRAGMA table_info(usage)")]
+        if cols and "cost_usd" not in cols:
+            self.db.execute("ALTER TABLE usage ADD COLUMN cost_usd REAL")
+            rows = self.db.execute(
+                "SELECT id, model, input_tokens, output_tokens, cache_read, cache_write FROM usage"
+            ).fetchall()
+            for r in rows:
+                cost = cost_usd(r["model"], r["input_tokens"], r["output_tokens"], r["cache_read"], r["cache_write"])
+                self.db.execute("UPDATE usage SET cost_usd=? WHERE id=?", (cost, r["id"]))
 
     # --- доступ ---
 
@@ -124,32 +147,56 @@ class Storage:
             "SELECT COUNT(*) FROM messages WHERE conversation_id=?", (conv_id,)
         ).fetchone()[0]
 
+    def purge_old_conversations(self, older_than: float) -> int:
+        """Удаляет сообщения брошенных диалогов (не текущих ни у кого), где последнее сообщение старше
+        older_than. Текущие диалоги не трогает. Возвращает число удалённых сообщений."""
+        cur = self.db.execute(
+            """
+            DELETE FROM messages WHERE conversation_id IN (
+                SELECT c.id FROM conversations c
+                WHERE c.id NOT IN (SELECT conversation_id FROM users WHERE conversation_id IS NOT NULL)
+                  AND COALESCE((SELECT MAX(m.created_at) FROM messages m WHERE m.conversation_id = c.id),
+                               c.created_at) < ?
+            )
+            """,
+            (older_than,),
+        )
+        self.db.commit()
+        return cur.rowcount
+
     # --- расход ---
 
-    def add_usage(self, user_id: int, model: str, usage) -> None:
+    def add_usage(
+        self,
+        user_id: int,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read: int,
+        cache_write: int,
+        cost_usd: float | None,
+    ) -> None:
         self.db.execute(
-            "INSERT INTO usage(user_id, model, input_tokens, output_tokens, cache_read, cache_write, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (
-                user_id,
-                model,
-                usage.input_tokens or 0,
-                usage.output_tokens or 0,
-                usage.cache_read_input_tokens or 0,
-                usage.cache_creation_input_tokens or 0,
-                time.time(),
-            ),
+            "INSERT INTO usage(user_id, model, input_tokens, output_tokens, cache_read, cache_write,"
+            " created_at, cost_usd) VALUES (?,?,?,?,?,?,?,?)",
+            (user_id, model, input_tokens, output_tokens, cache_read, cache_write, time.time(), cost_usd),
         )
         self.db.commit()
 
     def usage_since(self, since: float, user_id: int | None = None) -> list[sqlite3.Row]:
+        """Расход по (пользователь, модель): число обращений, сумма в $ и сколько обращений без известной цены."""
         q = (
-            "SELECT user_id, model, SUM(input_tokens) i, SUM(output_tokens) o,"
-            " SUM(cache_read) cr, SUM(cache_write) cw, COUNT(*) n FROM usage WHERE created_at>=?"
+            "SELECT user_id, model, COUNT(*) n, COALESCE(SUM(cost_usd), 0) cost,"
+            " SUM(cost_usd IS NULL) unpriced FROM usage WHERE created_at>=?"
         )
         args: list = [since]
         if user_id is not None:
             q += " AND user_id=?"
             args.append(user_id)
-        q += " GROUP BY user_id, model"
+        q += " GROUP BY user_id, model ORDER BY user_id, model"
         return list(self.db.execute(q, args))
+
+    def spent_since(self, user_id: int, since: float) -> float:
+        return self.db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage WHERE user_id=? AND created_at>=?", (user_id, since)
+        ).fetchone()[0]

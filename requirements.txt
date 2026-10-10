@@ -1,3 +1,4 @@
 aiogram==3.31.0
 anthropic==1.13.0
 chatgpt-md-converter==0.3.12
+pillow==12.3.0

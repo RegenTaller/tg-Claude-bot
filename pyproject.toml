@@ -1,0 +1,10 @@
+# Только настройки инструментов разработки. Зависимости бота — в requirements.txt,
+# для тестов — в requirements-dev.txt.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
